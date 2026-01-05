@@ -1,126 +1,123 @@
 
-import os
 import pandas as pd
-import dash
-from dash import html, dcc
+from dash import Dash, html, dcc, dash_table
 import plotly.express as px
+from pathlib import Path
+import re
+import unicodedata
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RUTA_XLSX = os.path.join(BASE_DIR, "dashboard.xlsx")
+# ---------- Ruta ----------
+BASE_DIR = Path(__file__).resolve().parent
+excel_path = BASE_DIR / "dashboard.xlsx"
 
-# Columnas que tu dashboard espera (ajústalas si cambian)
-COLUMNAS_ESPERADAS = ["Categoría", "Estado", "Gravedad"]
-
-def cargar_datos():
-    if not os.path.exists(RUTA_XLSX):
-        raise FileNotFoundError(f"No se encontró el archivo: {RUTA_XLSX}")
-
-    # --- Lee sin encabezados para poder detectar la fila de header ---
-    # (Si tu archivo tiene varias hojas, especifica sheet_name="Hoja1" u otro)
-    raw = pd.read_excel(RUTA_XLSX, engine="openpyxl", header=None)
-
- # Busca la fila que contenga todas las columnas esperadas
-    header_row_idx = None
-    for idx in range(min(10, len(raw))):  # busca en las primeras 10 filas
-        fila = raw.iloc[idx].astype(str).str.strip().tolist()
-        if all(col in fila for col in COLUMNAS_ESPERADAS):
-            header_row_idx = idx
-            break
-
-    if header_row_idx is None:
-        # Si no se halló exactamente, intenta una detección parcial
-        for idx in range(min(10, len(raw))):
-            fila = raw.iloc[idx].astype(str).str.strip().tolist()
-            # Si al menos 2 de las esperadas están en la fila, la tomamos como header
-            match_count = sum(col in fila for col in COLUMNAS_ESPERADAS)
-            if match_count >= 2:
-                header_row_idx = idx
-                break
-
-if header_row_idx is None:
-        # Último recurso: imprimir primeras filas para que veas qué hay
-        preview = raw.head(5).to_string(index=False)
-        raise ValueError(
-            "No pude detectar la fila de encabezados.\n"
-            f"Revisa las primeras filas del Excel:\n{preview}\n"
-            "Opciones: mueve los encabezados a la primera fila, indica sheet_name, "
-            "o dime los nombres exactos de las columnas para ajustar."
-        )
-
-    # Relee con el header correcto (saltando filas previas)
-    df = pd.read_excel(
-        RUTA_XLSX,
-        engine="openpyxl",
-        header=header_row_idx
-    )
-
- # Limpieza básica
-    df = df.dropna(how="all")
-
-    # Validar columnas esperadas
-    faltantes = set(COLUMNAS_ESPERADAS) - set(df.columns)
-    if faltantes:
-        # A veces vienen con espacios o mayúsculas distintas; normaliza
-        # Intento de normalización simple:
-        mapeo = {}
-        for col in df.columns:
-            norm = col.strip().lower()
-            if norm == "categoria":
-                mapeo[col] = "Categoría"
-            elif norm == "estado":
-                mapeo[col] = "Estado"
-            elif norm == "gravedad":
-                mapeo[col] = "Gravedad"
-
-  if mapeo:
-            df = df.rename(columns=mapeo)
-            faltantes = set(COLUMNAS_ESPERADAS) - set(df.columns)
-
-    if faltantes:
-        raise KeyError(
-            f"Faltan columnas: {faltantes}. Columnas detectadas: {list(df.columns)}.\n"
-            "Ajusta los encabezados del Excel o actualiza COLUMNAS_ESPERADAS."
-        )
-
-    # Quita filas donde falten claves
-    df = df.dropna(subset=["Categoría", "Estado", "Gravedad"])
-
-    # Opcional: convierte tipos si hace falta
-    # df["Gravedad"] = pd.to_numeric(df["Gravedad"], errors="coerce")
-
-    return df
-
-df = cargar_datos()
-
-# --- Gráficos ---
-fig_categoria = px.bar(
-    df,
-    x="Categoría",
-    title="No conformidades por categoría",
-)
-fig_estado = px.pie(
-    df,
-    names="Estado",
-    title="Distribución por estado",
-)
-fig_gravedad = px.histogram(
-    df,
-    x="Gravedad",
-    title="Distribución por gravedad",
+# ---------- Lectura: usar la HOJA 'base' y encabezado en la fila 1 (header=0) ----------
+df = pd.read_excel(
+    excel_path,
+    engine="openpyxl",
+    sheet_name="base",  # <- hoja correcta según tu diagnóstico
+    header=0,
+    usecols="A:E"       # <- columnas A a E: ID, CATEGORIA, SUPERVISOR, GRAVEDAD, DESCRIPCION-DEL-RECLAMO
 )
 
-# --- App Dash ---
-app = dash.Dash(__name__)
-app.title = "Dashboard de No Conformidades"
+# ---------- Normalización de encabezados ----------
+def normalize_header(s: str) -> str:
+    s = str(s).strip().upper()
+    # quitar acentos
+    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+    # convertir guiones/guiones bajos en espacios
+    s = s.replace("_", " ").replace("-", " ")
+    # colapsar espacios
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+df.columns = [normalize_header(c) for c in df.columns]
+
+# ---------- Validación y mapeo (por si hay pequeñas variaciones) ----------
+variantes = {
+    "ID": ["ID"],
+    "CATEGORIA": ["CATEGORIA"],
+    "SUPERVISOR": ["SUPERVISOR"],
+    "GRAVEDAD": ["GRAVEDAD"],
+    "DESCRIPCION DEL RECLAMO": [
+        "DESCRIPCION DEL RECLAMO", "DESCRIPCION DEL-RECLAMO", "DESCRIPCION-DEL-RECLAMO",
+        "DESCRIPCION RECLAMO", "DESCRIPCION"
+    ],
+}
+
+mapa = {}
+for estandar, posibles in variantes.items():
+    posibles_norm = {normalize_header(v) for v in posibles}
+    encontrada = next((c for c in df.columns if c in posibles_norm), None)
+    if encontrada:
+        mapa[encontrada] = estandar
+
+df = df.rename(columns=mapa)
+
+esperadas = list(variantes.keys())
+faltantes = [c for c in esperadas if c not in df.columns]
+if faltantes:
+    raise KeyError(f"Faltan columnas: {faltantes}. Detectadas: {list(df.columns)}")
+
+# ---------- Limpieza y tipos ----------
+for c in ["ID", "CATEGORIA", "SUPERVISOR", "DESCRIPCION DEL RECLAMO"]:
+    df[c] = df[c].astype(str).str.strip()
+
+# Intentar convertir GRAVEDAD a numérico si aplica
+def to_numeric_safe(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.replace(".", "", regex=False)  # miles
+    s = s.str.replace(",", ".", regex=False)                  # coma decimal -> punto
+    return pd.to_numeric(s, errors="coerce")
+
+if not pd.api.types.is_numeric_dtype(df["GRAVEDAD"]):
+    df["GRAVEDAD_NUM"] = to_numeric_safe(df["GRAVEDAD"])
+else:
+    df["GRAVEDAD_NUM"] = df["GRAVEDAD"]
+
+# ---------- Gráficos ----------
+cat_ct = df["CATEGORIA"].astype(str).value_counts(dropna=False).reset_index()
+cat_ct.columns = ["CATEGORIA", "CANTIDAD"]
+fig_categoria = px.bar(cat_ct, x="CATEGORIA", y="CANTIDAD", title="Reclamos por CATEGORIA")
+
+sup_ct = df["SUPERVISOR"].astype(str).value_counts(dropna=False).nlargest(15).reset_index()
+sup_ct.columns = ["SUPERVISOR", "CANTIDAD"]
+fig_supervisor = px.bar(sup_ct, x="SUPERVISOR", y="CANTIDAD", title="Top 15 SUPERVISORES por cantidad")
+
+if df["GRAVEDAD_NUM"].notna().sum() > 0:
+    fig_gravedad = px.histogram(df, x="GRAVEDAD_NUM", nbins=20, title="Distribución de GRAVEDAD (numérica)")
+    fig_gravedad.update_xaxes(title="GRAVEDAD")
+else:
+    grav_ct = df["GRAVEDAD"].astype(str).value_counts(dropna=False).reset_index()
+    grav_ct.columns = ["GRAVEDAD", "CANTIDAD"]
+    fig_gravedad = px.bar(grav_ct, x="GRAVEDAD", y="CANTIDAD", title="Distribución de GRAVEDAD (categorías)")
+
+# ---------- Tabla ----------
+cols_tabla = ["ID", "CATEGORIA", "SUPERVISOR", "GRAVEDAD", "DESCRIPCION DEL RECLAMO"]
+tabla = dash_table.DataTable(
+    columns=[{"name": c, "id": c} for c in cols_tabla],
+    data=df[cols_tabla].tail(25).to_dict("records"),
+    page_size=25,
+    style_table={"overflowX": "auto"},
+    style_cell={"textAlign": "left", "padding": "6px"},
+)
+
+# ---------- App ----------
+app = Dash(__name__)
+app.title = "Tablero de No Conformidades"
+
 app.layout = html.Div(
     [
-        html.H1("Dashboard de No Conformidades", style={"textAlign": "center"}),
+        html.H1("Tablero de No Conformidades", style={"textAlign": "center"}),
         dcc.Graph(figure=fig_categoria),
-        dcc.Graph(figure=fig_estado),
+        dcc.Graph(figure=fig_supervisor),
         dcc.Graph(figure=fig_gravedad),
+        html.Hr(),
+        html.H3("Últimos 25 registros"),
+        tabla,
     ],
     style={"maxWidth": "1100px", "margin": "0 auto", "padding": "20px"},
 )
 
 if __name__ == "__main__":
-    app.run_server(debug=True, host="127.0.0.1", port=8050)
+    app.run(debug=True, host="127.0.0.1", port=8050)
+
+
